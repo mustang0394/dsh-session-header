@@ -33,26 +33,46 @@ function installFetchRecorder() {
   }
 }
 
-/** Cordis-like context stub: captures on() handlers, runs effect() setup. */
-function makeContext() {
+/**
+ * Cordis-like context stub: captures on() handlers, runs effect() setup.
+ *
+ * `llm` a provider directory as `listConfigurableProviders()` would return it,
+ * `settings` a live Settings document as `describe()` would return it. Leave
+ * either out to model a host where endpoint resolution is impossible.
+ */
+function makeContext({ llm, settings } = {}) {
   const handlers = new Map()
   const disposers = []
+  const warnings = []
   const ctx = {
-    logger: { warn() {} },
+    logger: {
+      warn(message) {
+        warnings.push(String(message))
+      },
+    },
     on(event, handler) {
       handlers.set(event, handler)
     },
     effect(fn) {
       disposers.push(fn())
     },
+    get(name) {
+      return name === 'settings' && settings !== undefined ? { describe: () => settings } : undefined
+    },
+    ...(llm === undefined ? {} : { llm }),
   }
-  return { ctx, handlers, disposers }
+  return { ctx, handlers, disposers, warnings }
 }
 
-/** Install recorder, apply plugin, and wire automatic cleanup. */
-function boot(t, config = {}) {
+/**
+ * Install recorder, apply plugin, and wire automatic cleanup.
+ *
+ * `host` carries the optional `llm` / `settings` seams, kept separate from the
+ * plugin config so tests read as "configure the plugin, arrange the host".
+ */
+function boot(t, config = {}, host = {}) {
   const recorder = installFetchRecorder()
-  const { ctx, handlers, disposers } = makeContext()
+  const { ctx, handlers, disposers, warnings } = makeContext(host)
   // Go through the Schema, the way the harness loads the plugin: defaults for
   // toolEndpoints/overwriteHeaders/header come from Config, not from apply().
   apply(ctx, Config(config))
@@ -60,7 +80,7 @@ function boot(t, config = {}) {
     for (const dispose of disposers) dispose?.()
     recorder.restore()
   })
-  return { ctx, handlers, recorder }
+  return { ctx, handlers, recorder, warnings }
 }
 
 test('tools/execute: injects header when URL matches a configured endpoint prefix', async (t) => {
@@ -337,4 +357,275 @@ test('tools/execute: case-insensitive overwrite of a placeholder header', async 
   await handlers.get('tools/execute')(exec, next)
   assert.equal(recorder.calls.length, 1)
   assert.equal(recorder.calls[0].headers.get('x-opencode-session'), 'uuid-123')
+})
+
+// --- fetch slot re-claiming -------------------------------------------------
+//
+// `globalThis.fetch` is one process-wide mutable slot. Any component that takes
+// it after this plugin loads pushes the injection out of the call chain, and
+// every later request silently goes out without the header until the plugin is
+// unloaded and re-applied. That is the "disable and re-enable the plugin" work-
+// around reported on Windows, where a fetch-owning plugin happens to load
+// later. These tests pin the fix: the slot is re-claimed on demand.
+
+/** Take the fetch slot the way a later plugin would, recording what reaches it. */
+function takeFetchSlot({ forwards }) {
+  const previous = globalThis.fetch
+  const seen = []
+  const replacement = async (input, init) => {
+    const headers = new Headers(input instanceof Request ? input.headers : undefined)
+    if (init?.headers !== undefined) {
+      for (const [key, value] of new Headers(init.headers)) headers.set(key, value)
+    }
+    seen.push({ url: String(input), headers })
+    return forwards ? previous(input, init) : new Response('ok', { status: 200 })
+  }
+  globalThis.fetch = replacement
+  return { seen, replacement }
+}
+
+async function drain(iterable) {
+  for await (const _ of iterable) {
+    /* consume every chunk so the adapter's fetch has run */
+  }
+}
+
+test('fetch replaced after load: llm/stream re-claims the slot and still injects', async (t) => {
+  const { handlers } = boot(t, { header: 'x-session-id' })
+  // A later plugin overwrites the slot without delegating: our patch is now
+  // out of the chain, which is exactly the reported failure.
+  const { seen } = takeFetchSlot({ forwards: false })
+
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  await drain(handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner()))
+
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].headers.get('x-session-id'), 'abc')
+})
+
+test('fetch replaced after load: a delegating wrapper is re-wrapped, not replaced', async (t) => {
+  const { handlers } = boot(t, { header: 'x-session-id' })
+  const { seen } = takeFetchSlot({ forwards: true })
+  const replacement = globalThis.fetch
+
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  await drain(handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner()))
+
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].headers.get('x-session-id'), 'abc')
+  // The other plugin's implementation must stay underneath ours.
+  const wrapped = globalThis.fetch
+  assert.notEqual(wrapped, replacement)
+  assert.ok(typeof wrapped === 'function')
+})
+
+test('fetch replaced after load: tools/execute re-claims the slot too', async (t) => {
+  const { handlers } = boot(t, {
+    header: 'x-session-id',
+    toolEndpoints: ['https://gateway.example.com/'],
+  })
+  const { seen } = takeFetchSlot({ forwards: false })
+
+  await handlers.get('tools/execute')({ agent: { id: 'session-uuid-123' } }, async () => {
+    await fetch('https://gateway.example.com/messages')
+  })
+
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].headers.get('x-session-id'), 'uuid-123')
+})
+
+test('a replacement that forwards through globalThis.fetch does not recurse forever', async (t) => {
+  const { handlers } = boot(t, { header: 'x-session-id' })
+  // Worst case: the replacement reads the slot again instead of the transport
+  // it captured, so re-wrapping it would bounce between the two functions.
+  let hops = 0
+  globalThis.fetch = async (input, init) => {
+    if (++hops > 50) throw new Error('fetch dispatch recursed')
+    return globalThis.fetch(input, init)
+  }
+
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  // Must settle rather than overflow the stack; the guard falls back to the
+  // transport underneath, which is what actually reaches the network.
+  await drain(handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner()))
+  assert.ok(hops >= 1)
+})
+
+test('unloading after a re-wrap hands the slot back to the replacement', async (t) => {
+  const recorder = installFetchRecorder()
+  const { ctx, handlers, disposers } = makeContext()
+  apply(ctx, Config({}))
+  t.after(() => recorder.restore())
+
+  // Someone replaces fetch, then a stream step re-wraps it.
+  const replacement = async () => new Response('ok', { status: 200 })
+  globalThis.fetch = replacement
+
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  await drain(handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner()))
+  assert.notEqual(globalThis.fetch, replacement, 'stream step claims the slot')
+
+  // Unloading must not clobber the other plugin's transport.
+  for (const dispose of disposers) dispose?.()
+  assert.equal(globalThis.fetch, replacement)
+})
+
+test('a non-callable fetch in the slot does not poison later requests', async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  // Something cleared or clobbered the slot with a non-function. Re-wrapping
+  // that would turn every request into a TypeError, so the plugin must keep
+  // the last usable transport instead.
+  globalThis.fetch = undefined
+
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  await drain(handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner()))
+
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+})
+
+// --- LLM-phase endpoint gate ------------------------------------------------
+//
+// The `llm/stream` scope used to trust every fetch that ran inside it, which
+// let unrelated traffic in the same promise chain (telemetry, another plugin's
+// network work) carry the session id. The scope is now narrowed to the baseURL
+// of the route being called. A route whose endpoint cannot be established keeps
+// the historical unrestricted behaviour, so an unknown adapter never silently
+// loses the header.
+
+/** A provider directory entry as `listConfigurableProviders()` returns it. */
+function providerDirectory(entries) {
+  return { listConfigurableProviders: () => entries }
+}
+
+/** A Settings document carrying configured providers, as `describe()` returns it. */
+function settingsDocument(ns, providers) {
+  return [{ ns, value: { providers } }]
+}
+
+test('llm/stream: a declared provider is narrowed to its configured baseURL', async (t) => {
+  const { handlers, recorder } = boot(
+    t,
+    { header: 'x-session-id' },
+    {
+      llm: providerDirectory([
+        { provider: 'new-api', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'new-api'] },
+      ]),
+      settings: settingsDocument('llm-pi-ai', {
+        'new-api': { baseURL: 'https://gw.example.com/v1' },
+      }),
+    },
+  )
+
+  async function* inner() {
+    await fetch('https://gw.example.com/v1/chat/completions')
+    // Unrelated traffic inside the same stream must stay untouched.
+    await fetch('https://telemetry.example.org/report')
+    yield 'chunk-1'
+  }
+  for await (const _ of handlers.get('llm/stream')({ provider: 'new-api', sessionId: 'session-abc' }, () => inner())) {
+    /* drain */
+  }
+
+  assert.equal(recorder.calls.length, 2)
+  assert.equal(recorder.calls[0].url, 'https://gw.example.com/v1/chat/completions')
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  assert.equal(recorder.calls[1].url, 'https://telemetry.example.org/report')
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+})
+
+test('llm/stream: a catalog provider is narrowed by defaultBaseURL', async (t) => {
+  const { handlers, recorder } = boot(
+    t,
+    { header: 'x-session-id' },
+    {
+      llm: providerDirectory([{ provider: 'deepseek', defaultBaseURL: 'https://api.deepseek.com' }]),
+    },
+  )
+
+  async function* inner() {
+    await fetch('https://api.deepseek.com/anthropic/v1/messages')
+    await fetch('https://telemetry.example.org/report')
+    yield 'chunk-1'
+  }
+  for await (const _ of handlers.get('llm/stream')({ provider: 'deepseek', sessionId: 'session-abc' }, () => inner())) {
+    /* drain */
+  }
+
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+})
+
+test('llm/stream: an unresolvable route keeps the unrestricted behaviour', async (t) => {
+  // No provider directory at all: the endpoint is unknown, so the plugin must
+  // not start dropping headers it used to send.
+  const { handlers, recorder, warnings } = boot(t, { header: 'x-session-id' })
+
+  async function* inner() {
+    await fetch('https://api.deepseek.com/anthropic/v1/messages')
+    yield 'chunk-1'
+  }
+  for await (const _ of handlers.get('llm/stream')({ provider: 'deepseek', sessionId: 'session-abc' }, () => inner())) {
+    /* drain */
+  }
+
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  assert.ok(warnings.some((line) => line.includes('could not resolve a baseURL')))
+})
+
+test('llm/stream: a provider missing from the directory is warned once, not per call', async (t) => {
+  const { handlers, warnings } = boot(
+    t,
+    { header: 'x-session-id' },
+    { llm: providerDirectory([]) },
+  )
+
+  async function* inner() {
+    await fetch('https://gw.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  for (let call = 0; call < 3; call += 1) {
+    for await (const _ of handlers.get('llm/stream')({ provider: 'unknown', sessionId: 'session-abc' }, () => inner())) {
+      /* drain */
+    }
+  }
+
+  assert.equal(warnings.filter((line) => line.includes('could not resolve a baseURL')).length, 1)
+})
+
+test('llm/stream: tool-phase whitelist is independent of the LLM endpoint gate', async (t) => {
+  const { handlers, recorder } = boot(
+    t,
+    { header: 'x-session-id', toolEndpoints: ['https://gateway.example.com/'] },
+    {
+      llm: providerDirectory([
+        { provider: 'new-api', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'new-api'] },
+      ]),
+      settings: settingsDocument('llm-pi-ai', { 'new-api': { baseURL: 'https://gw.example.com/v1' } }),
+    },
+  )
+
+  // The LLM route baseURL must not widen the tool whitelist.
+  await handlers.get('tools/execute')({ agent: { id: 'session-uuid-123' } }, async () => {
+    await fetch('https://gw.example.com/v1/messages')
+    await fetch('https://gateway.example.com/messages')
+  })
+
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+  assert.equal(recorder.calls[1].headers.get('x-session-id'), 'uuid-123')
 })

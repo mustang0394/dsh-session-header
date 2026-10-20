@@ -78,6 +78,8 @@ x-session-id: ba104306-a748-4052-a6e3-ab60be2e4c1f
 - `llm-deepseek` adapter 自身每次请求已带 `x-deepseek-harness-session-id`；本插件是 provider 中立的，且刻意不覆盖已有 header。
 - 绝不触碰 `attributionHeaders()`（harness 的 User-Agent 归因契约）。
 - 并发会话正确处理：header 值按调用经由 AsyncLocalStorage 解析，不经过共享可变状态。
+- 模型调用的作用域现在收窄到**本次请求所用路由的 baseURL**：只有发往该端点的请求才带 header，因此同一条 promise 链上发生的无关流量（遥测、其他插件的网络调用）不会携带 session id。端点从 provider 目录读取 —— 内置路由取 `defaultBaseURL`，profile 中声明的路由则从 Settings 文档读实际 `baseURL`。若某路由的端点无法确定，则保持原有的不限制行为（只打一次 `warn`），而不是静默丢弃 header。工具阶段不受影响，仍由 `toolEndpoints` 控制。
+- `globalThis.fetch` 是进程级的单一槽位。若有组件在本插件加载**之后**抢占该槽位，注入就会被挤出调用链，并在之后所有请求上静默失效 —— 表现就是"请求没带 header，直到把插件禁用再启用"。因此插件会在每个流式步骤和每次工具派发前重新夺回最外层：把当时的实现收作内层 transport 并在其上重新包装（会打一条 `warn`）。卸载时恢复的是这个内层 transport，而不是覆盖掉后加载插件的补丁。
 
 ## 许可
 

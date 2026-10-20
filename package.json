@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-header",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Inject an x-session-id HTTP header onto every DeepSeek Harness LLM provider request, carrying the harness session id of that exact call; also covers whitelisted gateway fetches during tool execution.",
   "type": "module",
   "main": "index.js",
