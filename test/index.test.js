@@ -460,6 +460,127 @@ test('a replacement that forwards through globalThis.fetch does not recurse fore
   assert.ok(hops >= 1)
 })
 
+test('a replacement that awaits before forwarding does not recurse forever', { timeout: 5000 }, async (t) => {
+  const { handlers, recorder } = boot(t, { header: 'x-session-id' })
+  // The natural shape of an async network helper: capture the current fetch,
+  // await something (proxy lookup, telemetry, a lock), then delegate. A
+  // synchronous re-entrancy flag is already reset by then, so this re-entry
+  // used to allocate until the host process ran out of heap. The failure mode
+  // was a hang rather than an assertion failure, hence the timeout.
+  const previous = globalThis.fetch
+  let forwards = 0
+  globalThis.fetch = async (input, init) => {
+    forwards += 1
+    await Promise.resolve()
+    return previous(input, init)
+  }
+
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  await drain(handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner()))
+
+  // The wrapper ran exactly once, and so did the request it forwards.
+  assert.equal(forwards, 1)
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+})
+
+test('a wrapper that rebuilds the request before retrying keeps the header', async (t) => {
+  // Downstream wrappers retry by rebuilding the Request instead of reusing the
+  // args they were handed. The retry belongs to the same model call, so it must
+  // still carry the header — gateways key on it.
+  const calls = []
+  let real = 0
+  const realFetch = async (input, init) => {
+    const headers = new Headers(input instanceof Request ? input.headers : undefined)
+    if (init?.headers !== undefined) {
+      for (const [key, value] of new Headers(init.headers)) headers.set(key, value)
+    }
+    calls.push({ headers })
+    real += 1
+    return new Response('ok', { status: real === 1 ? 429 : 200 })
+  }
+  const baseline = globalThis.fetch
+  const { ctx, handlers, disposers } = makeContext()
+  globalThis.fetch = realFetch
+  apply(ctx, Config({ header: 'x-session-id' }))
+  t.after(() => {
+    for (const dispose of disposers) dispose?.()
+    globalThis.fetch = baseline
+  })
+
+  const previous = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    const first = await previous(input, init)
+    if (first.status !== 429) return first
+    await Promise.resolve()
+    return previous(new Request('https://llm.example.com/v1/chat', { method: 'POST', body: '{}' }))
+  }
+
+  async function* inner() {
+    const response = await fetch('https://llm.example.com/v1/chat', { method: 'POST', body: '{}' })
+    yield response.status
+  }
+  const statuses = []
+  for await (const status of handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())) {
+    statuses.push(status)
+  }
+
+  assert.deepEqual(statuses, [200])
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].headers.get('x-session-id'), 'abc')
+  assert.equal(calls[1].headers.get('x-session-id'), 'abc', 'the rebuilt retry keeps the header')
+})
+
+test('tools/execute: an awaiting wrapper does not recurse and the whitelist still applies', { timeout: 5000 }, async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-session-id',
+    toolEndpoints: ['https://gateway.example.com/'],
+  })
+  const previous = globalThis.fetch
+  let forwards = 0
+  globalThis.fetch = async (input, init) => {
+    forwards += 1
+    await Promise.resolve()
+    return previous(input, init)
+  }
+
+  await handlers.get('tools/execute')({ agent: { id: 'session-uuid-123' } }, async () => {
+    await fetch('https://gateway.example.com/messages')
+    await fetch('https://web.example.org/page')
+  })
+
+  assert.equal(forwards, 2)
+  assert.equal(recorder.calls.length, 2)
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'uuid-123')
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+})
+
+test('a transport chain that never reaches fetch fails closed instead of exhausting the heap', { timeout: 5000 }, async (t) => {
+  // The slot already forwards through itself when the plugin loads, so the
+  // transport captured at apply time is not a network call either. A capped
+  // chain with a diagnostic error beats a multi-gigabyte heap exhaustion.
+  const baseline = globalThis.fetch
+  globalThis.fetch = (input, init) => globalThis.fetch(input, init)
+  const { ctx, handlers, disposers } = makeContext()
+  apply(ctx, Config({ header: 'x-session-id' }))
+  t.after(() => {
+    for (const dispose of disposers) dispose?.()
+    globalThis.fetch = baseline
+  })
+
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat')
+    yield 'chunk-1'
+  }
+  await assert.rejects(
+    drain(handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())),
+    /did not reach a transport/,
+  )
+})
+
 test('unloading after a re-wrap hands the slot back to the replacement', async (t) => {
   const recorder = installFetchRecorder()
   const { ctx, handlers, disposers } = makeContext()

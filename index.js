@@ -82,10 +82,24 @@ export function apply(ctx, config) {
   // and re-wraps whatever is installed now, so the header keeps being injected
   // for the rest of the process lifetime without a plugin unload/reload.
   let innerFetch = originalFetch
-  // Guards a wrapper that forwards by reading `globalThis.fetch` instead of
-  // keeping the previous implementation: re-wrapping such a wrapper would
-  // otherwise bounce between the two functions forever.
-  let dispatching = false
+  // Set by the disposer; a stream that is still in flight must not re-install the
+  // patch after the plugin was unloaded.
+  let disposed = false
+  // Marks a call that is already on its way downstream. A synchronous boolean
+  // cannot do this job: it is reset before a delegating wrapper ever comes
+  // back, so a wrapper that awaits and then falls back to `globalThis.fetch`
+  // would bounce between the two forever (and exhaust the host heap). The mark
+  // instead rides in an AsyncLocalStorage child scope, which is inherited
+  // across `await` and timers, so the re-entry is recognised however late it
+  // arrives — and it is per call, so concurrent requests never see each
+  // other's mark.
+  const DISPATCH_DEPTH = Symbol('dsh-session-header.dispatch-depth')
+  // A healthy chain is two hops: patch -> transport. Anything beyond this is a
+  // component that keeps forwarding back to the global slot.
+  const MAX_DISPATCH_DEPTH = 8
+  // Shared immutable store for the pass-through case: a fetch outside any LLM
+  // call still needs the downstream mark, but carries nothing else.
+  const UNSCOPED_DISPATCH = Object.freeze({ [DISPATCH_DEPTH]: 1 })
 
   // The Schema above already filled the defaults (the harness validates plugin
   // config through it), so these are read once here rather than re-defaulted on
@@ -227,31 +241,54 @@ export function apply(ctx, config) {
   const resolveValue = (id) =>
     fixedValue ?? (id === undefined ? undefined : String(id).replace(/^session-/, ''))
 
-  // One call to the transport currently underneath us. The re-entrancy guard
-  // covers a wrapper that forwards through `globalThis.fetch` instead of the
-  // implementation it captured: after re-wrapping we would call it, it would
-  // call us, and the request would never reach the network.
+  // One dispatch hop: the request goes to whatever occupied
+  // `globalThis.fetch` when `install()` last re-wrapped. The child store marks
+  // "this call is downstream now", so a wrapper that forwards back through the
+  // global slot is recognised on the far side of an `await`.
   const transport = (input, init) => {
     const next = innerFetch === patchedFetch ? originalFetch : innerFetch
-    if (dispatching) return originalFetch(input, init)
-    dispatching = true
-    try {
-      return next(input, init)
-    } finally {
-      dispatching = false
+    const parent = als.getStore()
+    const scoped =
+      parent === undefined
+        ? UNSCOPED_DISPATCH
+        : { ...parent, [DISPATCH_DEPTH]: (parent[DISPATCH_DEPTH] ?? 0) + 1 }
+    return als.run(scoped, () => next(input, init))
+  }
+
+  // The only destination a re-entry may use: the transport captured at apply
+  // time. It cannot route back into `patchedFetch` through `innerFetch`, which
+  // is what makes a wrapper's async delegation finite. A host where even that
+  // transport reads the global slot again would still recurse, so the chain is
+  // capped and fails closed with a diagnosable error instead of exhausting the
+  // process heap.
+  const dispatchTerminal = (input, init) => {
+    const store = als.getStore()
+    const depth = store[DISPATCH_DEPTH]
+    if (depth >= MAX_DISPATCH_DEPTH) {
+      throw new Error(
+        `dsh-session-header: fetch dispatch did not reach a transport after ${depth} hops; ` +
+          'a component in the fetch chain keeps forwarding back to globalThis.fetch',
+      )
     }
+    return als.run({ ...store, [DISPATCH_DEPTH]: depth + 1 }, () => originalFetch(input, init))
   }
 
   const patchedFetch = (input, init) => {
     const injection = als.getStore()
+    // A marked store means this call came out of the transport we just handed
+    // the request to. It still gets the header — a wrapper that rebuilds the
+    // request before retrying must not lose it — but it is dispatched straight
+    // to the terminal transport and never through `innerFetch` again.
+    const reentry = injection !== undefined && injection[DISPATCH_DEPTH] !== undefined
+    const dispatch = reentry ? dispatchTerminal : transport
     if (injection === undefined || injection.value === undefined) {
-      return transport(input, init)
+      return dispatch(input, init)
     }
     // Tool-phase scopes carry the whitelist gate; skip fetches that do not
     // target one of the configured endpoints so the session id never leaks to
     // third-party hosts the tools talk to.
     if (injection.toolPhase === true && !urlMatchesEndpoint(input)) {
-      return transport(input, init)
+      return dispatch(input, init)
     }
     // LLM-phase scopes are narrowed to the route being called: the stream may
     // run unrelated plugin traffic (telemetry, other network work) in its
@@ -259,7 +296,7 @@ export function apply(ctx, config) {
     // `llmEndpoint === undefined` means the route's endpoint is unknown, and
     // the historical unrestricted behaviour is kept.
     if (injection.toolPhase !== true && !llmEndpointAllows(input, injection.llmEndpoint)) {
-      return transport(input, init)
+      return dispatch(input, init)
     }
     // Collect headers from both fetch() spellings: a Request object carries
     // its own, and init.headers overrides them per the fetch standard.
@@ -271,15 +308,15 @@ export function apply(ctx, config) {
     // which case the live session id replaces whatever placeholder value
     // another layer (an official provider) hard-coded.
     if (headers.has(header) && !mayOverwrite) {
-      return transport(input, init)
+      return dispatch(input, init)
     }
     headers.set(header, injection.value)
     // A bare Request input owns its headers; rebuild it so the original —
     // which may be reused by the caller — keeps arriving providers without us.
     if (input instanceof Request && init === undefined) {
-      return transport(new Request(input, { headers }))
+      return dispatch(new Request(input, { headers }))
     }
-    return transport(input, { ...init, headers })
+    return dispatch(input, { ...init, headers })
   }
 
   // `globalThis.fetch` is a single mutable slot shared by the whole process, so
@@ -287,6 +324,7 @@ export function apply(ctx, config) {
   // every later request. Re-claim the outermost position on demand: whatever is
   // installed now becomes our transport, and we put our patch back on top.
   const install = () => {
+    if (disposed) return
     const current = globalThis.fetch
     if (current === patchedFetch) return
     // Keep the last usable transport when the slot was cleared or set to a
@@ -307,6 +345,7 @@ export function apply(ctx, config) {
   // in the callback body — undoing the patch in the same tick — so the fix
   // returns the restore as the disposer.
   ctx.effect(() => () => {
+    disposed = true
     if (globalThis.fetch === patchedFetch) {
       // Restore the transport we are sitting on, not necessarily the one we saw
       // at load: it may be a replacement we re-wrapped in the meantime.
