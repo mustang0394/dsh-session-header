@@ -10,6 +10,7 @@
 #                      tools/execute waterfall (see README)
 #   overwriteHeaders - header names this plugin may replace when already set,
 #                      e.g. a hard-coded placeholder from an official provider
+#                      (only entries naming the configured `header` apply)
 - insert:
     - id: session-header
       name: dsh-session-header

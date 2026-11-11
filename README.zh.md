@@ -17,7 +17,7 @@ harness 没有请求级 header 缝——`GenerateOptions` 没有 headers 字段�
 
 取值语义：
 
-- 默认：取当前调用 `GenerateOptions.sessionId`，并剥掉 harness 的 `session-` 品牌前缀（发送纯 UUID）——主会话各轮次、压缩/起标题辅助调用、in-process 子 agent 各自上报**自己的** session id（子 agent 拥有独立的 child session id）；
+- 默认：取当前调用 `GenerateOptions.sessionId` 并去掉品牌：`session-<uuid>` 与 `<agent>-session-<uuid>` 发送裸 UUID，其他 id 只去掉行首 `session-`——主会话各轮次、压缩/起标题辅助调用、in-process 子 agent 各自上报**自己的** session id（子 agent 拥有独立的 child session id）；
 - 配置 `value`：所有调用使用固定值（按配置原样发送，不剥前缀）；
 - 两者皆无的调用不发这个 header。
 
@@ -61,7 +61,7 @@ dsh --patch ./my-overlay.yml
 | `header` | string | `x-session-id` | 注入的 header 名；线上大小写不敏感 |
 | `value` | string | — | 固定值；不设 = 取当前调用的 harness session id |
 | `toolEndpoints` | string[] | `[]` | 工具执行期匹配的 URL 前缀。非空时，`tools/execute` 瀑布内的 fetch（例如工具里调用的网关 web-search Messages API）仅当 URL 以某前缀开头才注入 header——第三方工具目标（web_fetch 抓任意网页、GitHub、MCP 服务器等）不受影响。默认空 = 保持原有仅 LLM 注入行为 |
-| `overwriteHeaders` | string[] | `[]` | 允许本插件**覆盖**已有值的 header 名列表；未列出的头仍遵守"不覆盖"规则。某些官方 provider 会硬编码占位值（如 `dsh-web-search-deepseek` 发送 `x-opencode-session: dsh-web-search`），网关会当作缺失拒绝；把该头列入（`overwriteHeaders: [x-opencode-session]`）即可用真实的会话 id 替换占位值。大小写不敏感。 |
+| `overwriteHeaders` | string[] | `[]` | 允许本插件**覆盖**已有值的 header 名列表；只有与配置的 `header` 同名的条目才生效。未列出的头仍遵守"不覆盖"规则。某些官方 provider 会硬编码占位值（如 `dsh-web-search-deepseek` 发送 `x-opencode-session: dsh-web-search`），网关会当作缺失拒绝；把该头列入（`overwriteHeaders: [x-opencode-session]`）即可用真实的会话 id 替换占位值。大小写不敏感。 |
 
 ## 验证
 
@@ -78,7 +78,8 @@ x-session-id: ba104306-a748-4052-a6e3-ab60be2e4c1f
 - `llm-deepseek` adapter 自身每次请求已带 `x-deepseek-harness-session-id`；本插件是 provider 中立的，且刻意不覆盖已有 header。
 - 绝不触碰 `attributionHeaders()`（harness 的 User-Agent 归因契约）。
 - 并发会话正确处理：header 值按调用经由 AsyncLocalStorage 解析，不经过共享可变状态。
-- 模型调用的作用域现在收窄到**本次请求所用路由的 baseURL**：只有发往该端点的请求才带 header，因此同一条 promise 链上发生的无关流量（遥测、其他插件的网络调用）不会携带 session id。端点从 provider 目录读取 —— 内置路由取 `defaultBaseURL`，profile 中声明的路由则从 Settings 文档读实际 `baseURL`。若某路由的端点无法确定，则保持原有的不限制行为（只打一次 `warn`），而不是静默丢弃 header。工具阶段不受影响，仍由 `toolEndpoints` 控制。
+- 模型调用的作用域收窄到**本次请求所用路由的端点**：只有发往其中之一的请求才带 header，因此同一条 promise 链上发生的无关流量（遥测、其他插件的网络调用）不会携带 session id。端点从 provider 目录解析：优先采用 Settings 文档里的实时 `baseURL`（adapter 实际调用的值），同时保留 catalog `defaultBaseURL` 作为额外匹配，以覆盖仍有个别模型走 catalog 端点的路由。目录中找不到该路由时保持原有不限制行为（每个 provider 一条 `warn`），而不是静默丢弃 header；当该路由**所有**已知端点值都不可用（无法解析为 http(s)，例如配置的 `baseURL` 漏写 scheme 且没有 catalog 默认值）时，作用域改为**失败关闭**，避免一个 typo 把 header 扩散到无关 host。解析结果短暂缓存，并在 `settings/document-updated` / `llm/adapters-updated` 时失效；无法解析的路由、或当时读不到 Settings 值的路由，下一次调用会重试而不缓存。工具阶段不受影响，仍由 `toolEndpoints` 控制。
+- 非法的 `header` 名或固定 `value`（空名、空白、控制字符）在加载时即被识别：插件只打一条 `warn` 并保持禁用，而不是让每个模型请求都抛 `TypeError`。
 - `globalThis.fetch` 是进程级的单一槽位。若有组件在本插件加载**之后**抢占该槽位，注入就会被挤出调用链，并在之后所有请求上静默失效 —— 表现就是"请求没带 header，直到把插件禁用再启用"。因此插件会在每个流式步骤和每次工具派发前重新夺回最外层：把当时的实现收作内层 transport 并在其上重新包装（会打一条 `warn`）。卸载时恢复的是这个内层 transport，而不是覆盖掉后加载插件的补丁。
 - 重入判定跨异步边界：某组件捕获 `globalThis.fetch`、`await` 之后再委托回来不会成环；包装器**重建请求后重试**也仍会带上 header。派发链有硬上限，始终到不了真实传输的链路会失败关闭并抛出可诊断错误，而不是耗尽宿主堆。仍有一个已知边界：把请求交给调用之外创建的调度器（插件加载前就存在的 interval、队列或 worker）会丢失标记。
 

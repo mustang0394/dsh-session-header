@@ -259,13 +259,16 @@ test('llm/stream: never overwrites a header someone else already set', async (t)
 
 test('unloading restores the fetch that was installed before apply', async (t) => {
   const recorder = installFetchRecorder()
+  t.after(() => recorder.restore())
   const { ctx, disposers } = makeContext()
-  apply(ctx, Config({}))
-  const patched = globalThis.fetch
-  assert.notEqual(patched, recorder.fn)
-  for (const dispose of disposers) dispose?.()
+  try {
+    apply(ctx, Config({}))
+    const patched = globalThis.fetch
+    assert.notEqual(patched, recorder.fn)
+  } finally {
+    for (const dispose of disposers) dispose?.()
+  }
   assert.equal(globalThis.fetch, recorder.fn)
-  recorder.restore()
 })
 
 // --- review follow-ups: Request spelling, case-insensitive overwrite, boundary ---
@@ -749,4 +752,357 @@ test('llm/stream: tool-phase whitelist is independent of the LLM endpoint gate',
 
   assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
   assert.equal(recorder.calls[1].headers.get('x-session-id'), 'uuid-123')
+})
+
+// --- review fixes: endpoint precedence, fail-closed resolution, cache ------
+//
+// The provider directory reports both the catalog default endpoint and the
+// settings address of a route. The adapter calls the profile `baseURL` when it
+// is set, so the gate must prefer that value; a configured endpoint that is not
+// a usable http(s) URL must fail CLOSED instead of widening injection; and a
+// resolution miss must not be memoized for the whole TTL.
+
+test('llm/stream: a profile baseURL wins over the catalog default endpoint', async (t) => {
+  const { handlers, recorder } = boot(
+    t,
+    { header: 'x-session-id' },
+    {
+      llm: providerDirectory([
+        {
+          provider: 'deepseek',
+          settingsNs: 'llm-pi-ai',
+          settingsPath: ['providers', 'deepseek'],
+          defaultBaseURL: 'https://api.deepseek.com',
+        },
+      ]),
+      settings: settingsDocument('llm-pi-ai', { deepseek: { baseURL: 'https://gw.example.com/v1' } }),
+    },
+  )
+
+  async function* inner() {
+    await fetch('https://gw.example.com/v1/chat/completions')
+    await fetch('https://telemetry.example.org/report')
+    yield 'chunk-1'
+  }
+  for await (const _ of handlers.get('llm/stream')({ provider: 'deepseek', sessionId: 'session-abc' }, () => inner())) {
+    /* drain */
+  }
+
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+})
+
+test('llm/stream: an unusable configured baseURL fails closed', async (t) => {
+  const { handlers, recorder, warnings } = boot(
+    t,
+    { header: 'x-session-id' },
+    {
+      llm: providerDirectory([{ provider: 'p', settingsNs: 'ns', settingsPath: ['providers', 'p'] }]),
+      settings: settingsDocument('ns', { p: { baseURL: 'gateway.example.com/v1' } }),
+    },
+  )
+
+  async function* inner() {
+    await fetch('https://gateway.example.com/v1/chat')
+    await fetch('https://telemetry.example.org/report')
+    yield 'chunk-1'
+  }
+  for await (const _ of handlers.get('llm/stream')({ provider: 'p', sessionId: 'session-abc' }, () => inner())) {
+    /* drain */
+  }
+
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+  assert.ok(warnings.some((line) => line.includes('not a usable http(s) URL')))
+})
+
+test('llm/stream: a failed endpoint resolution is not cached', async (t) => {
+  let directory = []
+  const { handlers, recorder } = boot(
+    t,
+    { header: 'x-session-id' },
+    { llm: { listConfigurableProviders: () => directory } },
+  )
+
+  async function* inner() {
+    await fetch('https://telemetry.example.org/report')
+    await fetch('https://llm.example.com/v1/chat')
+    yield 'chunk-1'
+  }
+  const stream = () => handlers.get('llm/stream')({ provider: 'late', sessionId: 'session-abc' }, () => inner())
+
+  // Unknown route: historical unrestricted behaviour.
+  for await (const _ of stream()) {
+    /* drain */
+  }
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+
+  // The route (and its endpoint) appears after the first call; the very next
+  // call must narrow again, with no 30 s negative cache in between.
+  directory = [{ provider: 'late', defaultBaseURL: 'https://llm.example.com' }]
+  for await (const _ of stream()) {
+    /* drain */
+  }
+  assert.equal(recorder.calls[2].headers.has('x-session-id'), false)
+  assert.equal(recorder.calls[3].headers.get('x-session-id'), 'abc')
+})
+
+test('llm/stream: a settings update invalidates the memoized endpoint', async (t) => {
+  // `describe()` returns the live document; mutate it in place to model a
+  // settings edit, then let the event drop the memoized resolution.
+  const settings = [{ ns: 'ns', value: { providers: { p: { baseURL: 'https://old-gw.example.com/v1' } } } }]
+  const { handlers, recorder } = boot(
+    t,
+    { header: 'x-session-id' },
+    {
+      llm: providerDirectory([{ provider: 'p', settingsNs: 'ns', settingsPath: ['providers', 'p'] }]),
+      settings,
+    },
+  )
+
+  async function* inner() {
+    await fetch('https://new-gw.example.com/v1/chat')
+    yield 'chunk-1'
+  }
+  const stream = () => handlers.get('llm/stream')({ provider: 'p', sessionId: 'session-abc' }, () => inner())
+
+  for await (const _ of stream()) {
+    /* drain */
+  }
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+
+  settings[0].value.providers.p.baseURL = 'https://new-gw.example.com/v1'
+  handlers.get('settings/document-updated')('ns', 2)
+  for await (const _ of stream()) {
+    /* drain */
+  }
+  assert.equal(recorder.calls[1].headers.get('x-session-id'), 'abc')
+})
+
+test('llm/stream: each unresolvable provider is warned about once', async (t) => {
+  const { handlers, warnings } = boot(t, { header: 'x-session-id' }, { llm: providerDirectory([]) })
+  async function* inner() {
+    await fetch('https://x.example.com/')
+    yield 'chunk-1'
+  }
+  for (const provider of ['alpha', 'beta', 'alpha']) {
+    for await (const _ of handlers.get('llm/stream')({ provider, sessionId: 'session-abc' }, () => inner())) {
+      /* drain */
+    }
+  }
+  assert.equal(warnings.filter((line) => line.includes('could not resolve a baseURL')).length, 2)
+})
+
+// --- review fixes: configuration validation --------------------------------
+
+test('apply: an invalid header name disables injection instead of failing requests', (t) => {
+  const recorder = installFetchRecorder()
+  const { ctx, warnings } = makeContext()
+  t.after(() => recorder.restore())
+
+  apply(ctx, Config({ header: 'x session id' }))
+
+  assert.equal(globalThis.fetch, recorder.fn)
+  assert.ok(warnings.some((line) => line.includes('not a valid HTTP header name')))
+})
+
+test('apply: an invalid fixed value disables injection instead of failing requests', (t) => {
+  const recorder = installFetchRecorder()
+  const { ctx, warnings } = makeContext()
+  t.after(() => recorder.restore())
+
+  apply(ctx, Config({ value: 'line1\r\ninjected: yes' }))
+
+  assert.equal(globalThis.fetch, recorder.fn)
+  assert.ok(warnings.some((line) => line.includes('not a valid HTTP header value')))
+})
+
+// --- review fixes: tool scope isolation and fixed values -------------------
+
+test('tools/execute: a nested dispatch without an agent does not inherit the outer session', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-session-id',
+    toolEndpoints: ['https://gateway.example.com/'],
+  })
+  const handler = handlers.get('tools/execute')
+
+  await handler({ agent: { id: 'session-outer' } }, async () => {
+    await handler({}, async () => {
+      await fetch('https://gateway.example.com/messages')
+    })
+  })
+
+  assert.equal(recorder.calls.length, 1)
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+})
+
+test('tools/execute: a fixed value is injected even without an agent id', async (t) => {
+  const { handlers, recorder } = boot(t, {
+    header: 'x-session-id',
+    value: 'fixed-value',
+    toolEndpoints: ['https://gateway.example.com/'],
+  })
+
+  await handlers.get('tools/execute')({}, async () => {
+    await fetch('https://gateway.example.com/messages')
+  })
+
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'fixed-value')
+})
+
+// --- review fixes: generator close errors and inert unload -----------------
+
+test('llm/stream: a close error does not mask the stream error', async (t) => {
+  const { handlers } = boot(t, { header: 'x-session-id' })
+  const inner = {
+    [Symbol.asyncIterator]() {
+      return this
+    },
+    next() {
+      return Promise.reject(new Error('adapter-next-error'))
+    },
+    return() {
+      throw new Error('adapter-return-error')
+    },
+  }
+
+  await assert.rejects(
+    (async () => {
+      for await (const _ of handlers.get('llm/stream')({ provider: 'p', sessionId: 'session-abc' }, () => inner)) {
+        /* drain */
+      }
+    })(),
+    /adapter-next-error/,
+  )
+})
+
+test('unloading leaves a wrapper-captured patch inert', async (t) => {
+  const recorder = installFetchRecorder()
+  const { ctx, handlers, disposers } = makeContext()
+  t.after(() => recorder.restore())
+  apply(ctx, Config({ header: 'x-session-id' }))
+
+  // A later plugin wraps the slot and captures our patch as its inner
+  // transport; disposing us cannot own the slot back.
+  const captured = globalThis.fetch
+  const wrapper = async (input, init) => captured(input, init)
+  globalThis.fetch = wrapper
+
+  async function* inner() {
+    await fetch('https://llm.example.com/v1/chat')
+    yield 'chunk-1'
+  }
+  for await (const _ of handlers.get('llm/stream')({ sessionId: 'session-abc' }, () => inner())) {
+    /* drain */
+  }
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), 'abc')
+
+  for (const dispose of disposers) dispose?.()
+
+  // The wrapper still calls the old patch, which is now inert: the request
+  // reaches the transport exactly once and carries no header.
+  const response = await globalThis.fetch('https://llm.example.com/v1/chat')
+  assert.equal(response.status, 200)
+  assert.equal(recorder.calls.length, 2)
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+})
+
+// --- review fixes: session brand stripping --------------------------------
+
+test('llm/stream: a configured-agent session id loses its brand to the bare UUID', async (t) => {
+  const { handlers, recorder } = boot(
+    t,
+    { header: 'x-session-id' },
+    { llm: providerDirectory([{ provider: 'deepseek', defaultBaseURL: 'https://api.deepseek.com' }]) },
+  )
+  const uuid = '11111111-2222-4333-8444-555555555555'
+
+  async function* inner() {
+    await fetch('https://api.deepseek.com/v1/chat/completions')
+    yield 'chunk-1'
+  }
+  for await (const _ of handlers.get('llm/stream')({ provider: 'deepseek', sessionId: `main-session-${uuid}` }, () => inner())) {
+    /* drain */
+  }
+
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), uuid)
+})
+
+test('llm/stream: an invalid profile baseURL still matches a usable catalog default', async (t) => {
+  const { handlers, recorder, warnings } = boot(
+    t,
+    { header: 'x-session-id' },
+    {
+      llm: providerDirectory([
+        {
+          provider: 'deepseek',
+          settingsNs: 'ns',
+          settingsPath: ['providers', 'deepseek'],
+          defaultBaseURL: 'https://api.deepseek.com',
+        },
+      ]),
+      // Missing scheme: unusable as a match target, but the catalog default is.
+      settings: settingsDocument('ns', { deepseek: { baseURL: 'gw.example.com/v1' } }),
+    },
+  )
+
+  async function* inner() {
+    await fetch('https://api.deepseek.com/v1/chat')
+    await fetch('https://telemetry.example.org/report')
+    yield 'chunk-1'
+  }
+  for await (const _ of handlers.get('llm/stream')(
+    { provider: 'deepseek', sessionId: 'session-11111111-2222-4333-8444-555555555555' },
+    () => inner(),
+  )) {
+    /* drain */
+  }
+
+  assert.equal(recorder.calls[0].headers.get('x-session-id'), '11111111-2222-4333-8444-555555555555')
+  assert.equal(recorder.calls[1].headers.has('x-session-id'), false)
+  assert.ok(warnings.some((line) => line.includes('ignoring unparseable baseURL')))
+})
+
+test('llm/stream: a default-only match built while settings are unreadable is not cached', async (t) => {
+  const recorder = installFetchRecorder()
+  const { ctx, handlers, disposers } = makeContext()
+  t.after(() => {
+    for (const dispose of disposers) dispose?.()
+    recorder.restore()
+  })
+
+  // Settings service absent on the first call, then available (models a
+  // profile whose Settings document loads after the first model call).
+  let settingsReady = false
+  ctx.get = (name) =>
+    name === 'settings' && settingsReady
+      ? { describe: () => settingsDocument('llm-pi-ai', { deepseek: { baseURL: 'https://gw.example.com/v1' } }) }
+      : undefined
+  ctx.llm = providerDirectory([
+    {
+      provider: 'deepseek',
+      settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'deepseek'],
+      defaultBaseURL: 'https://api.deepseek.com',
+    },
+  ])
+  apply(ctx, Config({ header: 'x-session-id' }))
+
+  const uuid = '11111111-2222-4333-8444-555555555555'
+  async function* inner() {
+    await fetch('https://gw.example.com/v1/chat')
+    yield 'chunk-1'
+  }
+  const stream = () => handlers.get('llm/stream')({ provider: 'deepseek', sessionId: `session-${uuid}` }, () => inner())
+
+  for await (const _ of stream()) {
+    /* drain */
+  }
+  assert.equal(recorder.calls[0].headers.has('x-session-id'), false)
+
+  settingsReady = true
+  for await (const _ of stream()) {
+    /* drain */
+  }
+  assert.equal(recorder.calls[1].headers.get('x-session-id'), uuid)
 })
